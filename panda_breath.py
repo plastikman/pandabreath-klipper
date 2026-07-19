@@ -1,11 +1,12 @@
 # panda_breath.py — Klipper extras module for BIQU Panda Breath
 #
 # Exposes the Panda Breath as a standard Klipper heater (heater_generic interface).
-# Supports two firmware targets via a transport abstraction:
+# Supports three firmware targets via a transport abstraction:
 #
-#   firmware: stock   — OEM WebSocket JSON protocol (ws://<host>/ws)
-#                       Recommended firmware: v1.0.3+; v1.0.4 aliases supported
-#   firmware: esphome — ESPHome MQTT protocol (MQTT 3.1.1 over TCP)
+#   firmware: stock      — OEM WebSocket JSON protocol (ws://<host>/ws)
+#                          Recommended firmware: v1.0.3+; v1.0.4 aliases supported
+#   firmware: stock-mqtt — OEM v1.0.4+ native Home Assistant MQTT (over a broker)
+#   firmware: esphome    — ESPHome MQTT protocol (MQTT 3.1.1 over TCP)
 #
 # No external Python dependencies — stdlib only (socket, struct, hashlib, base64,
 # os, json, threading, collections, time, logging).  The module is a single-file
@@ -29,6 +30,15 @@
 #   check_gain_time: 120
 #   hysteresis: 5
 #   heating_gain: 1
+#
+# printer.cfg — stock firmware v1.0.4+ via native Home Assistant MQTT:
+#   [panda_breath]
+#   firmware: stock-mqtt
+#   mqtt_broker: 127.0.0.1
+#   mqtt_port: 1883
+#   mqtt_device_id: ACEBE68FE51C   # optional; auto-discovered from the state topic
+#   mqtt_username: panda           # optional; only if the broker requires auth
+#   mqtt_password: <secret>        # optional
 #
 # printer.cfg — ESPHome firmware:
 #   [panda_breath]
@@ -411,12 +421,15 @@ class _MqttTransport:
 
     _PING_INTERVAL = 30.
 
-    def __init__(self, broker, port, topic_prefix, on_message, on_disconnect):
+    def __init__(self, broker, port, topic_prefix, on_message, on_disconnect,
+                 username=None, password=None):
         self._broker = broker
         self._port = port
         self._prefix = topic_prefix
         self._on_message = on_message
         self._on_disconnect = on_disconnect
+        self._username = username
+        self._password = password
         self._sock = None
         self._running = False
         self._thread = None
@@ -560,7 +573,8 @@ class _MqttTransport:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(10.)
                 sock.connect((self._broker, self._port))
-                sock.sendall(self._build_connect())
+                sock.sendall(self._build_connect(
+                    username=self._username, password=self._password))
                 # Expect CONNACK (type 2)
                 ptype, _, body = self._recv_packet(sock)
                 if ptype != 2:
@@ -569,8 +583,8 @@ class _MqttTransport:
                 if len(body) >= 2 and body[1] != 0:
                     raise ConnectionError(
                         "MQTT: CONNACK refused, code=%d" % body[1])
-                # Subscribe to chamber temperature topic
-                temp_topic = "%s/sensor/chamber_temperature/state" % self._prefix
+                # Subscribe to the transport's temperature topic
+                temp_topic = self._subscribe_topic()
                 sock.sendall(self._build_subscribe(temp_topic, packet_id=1))
                 # Expect SUBACK (type 9)
                 ptype, _, _ = self._recv_packet(sock)
@@ -633,11 +647,87 @@ class _MqttTransport:
         if qos > 0:
             offset += 2  # skip packet ID (not used for QoS 0 publishes we send)
         payload = body[offset:].decode("utf-8", errors="replace").strip()
+        self._handle_message(topic, payload)
+
+    # ── overridable hooks (ESPHome defaults; see _StockMqttTransport) ──────────
+
+    def _subscribe_topic(self):
+        """Return the single MQTT topic this transport subscribes to."""
+        return "%s/sensor/chamber_temperature/state" % self._prefix
+
+    def _handle_message(self, topic, payload):
+        """Parse a received PUBLISH payload and forward a temperature update."""
         if topic.endswith("/chamber_temperature/state"):
             try:
                 self._on_message({"temperature": float(payload)})
             except (TypeError, ValueError):
                 pass
+
+
+class _StockMqttTransport(_MqttTransport):
+    """MQTT client for the *stock* Panda Breath firmware v1.0.4+ native HA MQTT.
+
+    Unlike the ESPHome transport, the stock firmware uses a fixed, MAC-based
+    topic scheme with JSON payloads:
+
+      subscribe: panda_breath/<id>/state    (JSON; read ``chamber_temp``)
+      publish:   panda_breath/<id>/command  (JSON; e.g. {"target_temp": 45})
+
+    ``<id>`` is the device MAC (e.g. "ACEBE68FE51C"); if not configured it is
+    auto-discovered from the first state topic received. To hold a
+    Klipper-commanded target the device is put in "power on" mode.
+    """
+
+    def __init__(self, broker, port, device_id, on_message, on_disconnect,
+                 username=None, password=None):
+        # topic_prefix is unused for the stock scheme
+        super().__init__(broker, port, None, on_message, on_disconnect,
+                         username=username, password=password)
+        self._device_id = device_id or None
+
+    def _subscribe_topic(self):
+        # Wildcard until the id is known, so it can be auto-discovered.
+        return "panda_breath/%s/state" % (self._device_id or "+")
+
+    def _command_topic(self):
+        return "panda_breath/%s/command" % self._device_id
+
+    def _handle_message(self, topic, payload):
+        parts = topic.split("/")
+        if len(parts) >= 3 and parts[0] == "panda_breath" and parts[-1] == "state":
+            if self._device_id is None:
+                self._device_id = parts[1]
+                logger.info("panda_breath: discovered device id %s",
+                            self._device_id)
+                # Now addressable — (re)apply the desired target.
+                if self._last_target:
+                    self.set_target(self._last_target)
+        try:
+            state = json.loads(payload)
+        except ValueError:
+            return
+        temp = state.get("chamber_temp")
+        if temp is not None:
+            try:
+                self._on_message({"temperature": float(temp)})
+            except (TypeError, ValueError):
+                pass
+
+    def set_target(self, degrees):
+        self._last_target = degrees
+        if self._device_id is None:
+            return  # not addressable yet; re-applied on discovery
+        if degrees > 0:
+            target = max(0, min(60, int(round(degrees))))
+            self._publish(self._command_topic(), json.dumps(
+                {"work_on": "ON", "mode": "power on", "target_temp": target}))
+        else:
+            self._publish(self._command_topic(), json.dumps({"work_on": "OFF"}))
+
+    def force_off(self):
+        self._last_target = 0.
+        if self._device_id is not None:
+            self._publish(self._command_topic(), json.dumps({"work_on": "OFF"}))
 
 
 # ─── Klipper heater class ──────────────────────────────────────────────────────
@@ -656,7 +746,12 @@ class PandaBreath:
 
         # Config
         firmware = config.get("firmware", "stock")
-        self.host = config.get("host")
+        # host/port apply only to the WebSocket ('stock') transport; the MQTT
+        # transports use mqtt_broker instead, so host is optional there.
+        if firmware == "stock":
+            self.host = config.get("host")
+        else:
+            self.host = config.get("host", None)
         self.port = config.getint("port", 80)
 
         # state — modified by reactor poll
@@ -697,8 +792,20 @@ class PandaBreath:
             broker = config.get("mqtt_broker")
             mqtt_port = config.getint("mqtt_port", 1883)
             prefix = config.get("mqtt_topic_prefix", "panda-breath")
+            user = config.get("mqtt_username", None)
+            pw = config.get("mqtt_password", None)
             self._transport = _MqttTransport(
-                broker, mqtt_port, prefix, self._enqueue, self._on_disconnect)
+                broker, mqtt_port, prefix, self._enqueue, self._on_disconnect,
+                username=user, password=pw)
+        elif firmware == "stock-mqtt":
+            broker = config.get("mqtt_broker")
+            mqtt_port = config.getint("mqtt_port", 1883)
+            device_id = config.get("mqtt_device_id", None)
+            user = config.get("mqtt_username", None)
+            pw = config.get("mqtt_password", None)
+            self._transport = _StockMqttTransport(
+                broker, mqtt_port, device_id, self._enqueue, self._on_disconnect,
+                username=user, password=pw)
         else:
             raise config.error("panda_breath: unknown firmware '%s'" % firmware)
 
