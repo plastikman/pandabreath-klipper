@@ -1,6 +1,3 @@
 [submodule "Panda_Breath"]
 	path = Panda_Breath
 	url = https://github.com/bigtreetech/Panda_Breath
-[submodule "klipper-firmware/components/klipper/klipper"]
-	path = klipper-firmware/components/klipper/klipper
-	url = https://github.com/nikhil-robinson/klipper.git

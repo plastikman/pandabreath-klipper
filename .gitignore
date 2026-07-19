@@ -17,10 +17,4 @@ esphome/.esphome/
 # Local reference repos cloned for development (not submodules)
 reference/
 
-# klipper-firmware ESP-IDF build artifacts
-klipper-firmware/build/
-klipper-firmware/sdkconfig
-klipper-firmware/sdkconfig.old
-klipper-firmware/components/klipper/klipper/out/
-
 .DS_Store

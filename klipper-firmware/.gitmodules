@@ -1,3 +1,0 @@
-[submodule "components/klipper/klipper"]
-	path = components/klipper/klipper
-	url = https://github.com/nikhil-robinson/klipper.git
