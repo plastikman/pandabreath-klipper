@@ -176,6 +176,9 @@ class _WebSocketTransport:
         self._last_target = 0.
         self._last_auto = None
         self._last_drying = None
+        # Serialize socket writes across the reactor thread (set_target /
+        # _send_settings) and the _run thread (pong / reconnect re-apply).
+        self._io_lock = threading.Lock()
 
     def start(self):
         self._running = True
@@ -308,7 +311,8 @@ class _WebSocketTransport:
         else:
             header = struct.pack("!BBQ", 0x81, 0xFF, length)
         try:
-            sock.sendall(header + mask + masked)
+            with self._io_lock:
+                sock.sendall(header + mask + masked)
         except Exception as exc:
             logger.warning("panda_breath: WS send error: %s", exc)
 
@@ -391,7 +395,8 @@ class _WebSocketTransport:
                         break
                     elif opcode == 0x9:  # ping → pong
                         pong = struct.pack("!BB", 0x8A, len(payload)) + payload
-                        sock.sendall(pong)
+                        with self._io_lock:
+                            sock.sendall(pong)
                     elif opcode in (0x1, 0x2):  # text or binary
                         self._dispatch(payload)
             except Exception as exc:
@@ -456,6 +461,10 @@ class _MqttTransport:
         self._running = False
         self._thread = None
         self._last_target = 0.
+        # Serialize all socket writes: set_target()/force_off() run on the
+        # reactor thread while _run() (PINGREQ, reconnect re-apply) writes the
+        # same socket — interleaved sendall()s could corrupt a frame (incl. OFF).
+        self._io_lock = threading.Lock()
 
     def start(self):
         self._running = True
@@ -469,7 +478,8 @@ class _MqttTransport:
         if sock is not None:
             try:
                 # Best-effort DISCONNECT
-                sock.sendall(b"\xe0\x00")
+                with self._io_lock:
+                    sock.sendall(b"\xe0\x00")
                 sock.close()
             except Exception:
                 pass
@@ -582,7 +592,8 @@ class _MqttTransport:
             return
         pkt = self._build_publish(topic, message)
         try:
-            sock.sendall(pkt)
+            with self._io_lock:
+                sock.sendall(pkt)
         except Exception as exc:
             logger.warning("panda_breath: MQTT publish error: %s", exc)
 
@@ -624,7 +635,8 @@ class _MqttTransport:
                     # Send PINGREQ on schedule
                     now = time.monotonic()
                     if now - last_ping >= self._PING_INTERVAL:
-                        sock.sendall(self._build_pingreq())
+                        with self._io_lock:
+                            sock.sendall(self._build_pingreq())
                         last_ping = now
                     try:
                         ptype, pflags, body = self._recv_packet(sock)
@@ -726,14 +738,20 @@ class _StockMqttTransport(_MqttTransport):
 
     def _handle_message(self, topic, payload):
         parts = topic.split("/")
-        if len(parts) >= 3 and parts[0] == self._prefix and parts[-1] == "state":
-            if self._device_id is None:
-                self._device_id = parts[1]
-                logger.info("panda_breath: discovered device id %s",
-                            self._device_id)
-                # Now addressable — (re)apply the desired target.
-                if self._last_target:
-                    self.set_target(self._last_target)
+        if not (len(parts) >= 3 and parts[0] == self._prefix
+                and parts[-1] == "state"):
+            return
+        device = parts[1]
+        if self._device_id is None:
+            self._device_id = device
+            logger.info("panda_breath: discovered device id %s", self._device_id)
+            # Now addressable — re-assert the desired state *including* OFF
+            # (target 0), so a pending off is never dropped on discovery.
+            self.set_target(self._last_target)
+        elif device != self._device_id:
+            # Another Panda sharing this broker/prefix — ignore its state so it
+            # can't drive our heating/reconciliation decisions.
+            return
         try:
             state = json.loads(payload)
         except (ValueError, TypeError):
@@ -807,6 +825,11 @@ class PandaBreath:
         self.filament_drying_active = False
         self._in_shutdown = False
         self._external_off_lockout = False
+        # True only while Klipper itself has commanded a native mode (auto or
+        # drying). The reconciliation uses this — never the device-*reported*
+        # mode — so a device put into auto/drying externally (HA / button / NVS
+        # resume) is still forced off.
+        self._native_mode_commanded = False
         self._last_temp_time = 0.
         self._sensor = None
         self._virtual_pin = None
@@ -913,6 +936,7 @@ class PandaBreath:
         self.remaining_seconds = 0
         self.drying_remaining_min = 0
         self._external_off_lockout = True
+        self._native_mode_commanded = False
         try:
             self._transport.force_off()
             return
@@ -977,6 +1001,7 @@ class PandaBreath:
         self._external_off_lockout = False
         self._clear_heater_target_state()
         self.auto_enabled = bool(enabled)
+        self._native_mode_commanded = bool(enabled)
         self.auto_target = int(target)
         self.auto_filtertemp = int(filtertemp)
         self.auto_hotbedtemp = int(hotbedtemp)
@@ -1006,6 +1031,7 @@ class PandaBreath:
             raise gcmd.error(
                 "Panda Breath drying mode is only available with stock firmware transport")
         self._external_off_lockout = False
+        self._native_mode_commanded = True
         self._clear_heater_target_state()
         self.auto_enabled = False
         self.target = 0.
@@ -1138,11 +1164,12 @@ class PandaBreath:
                     if not self.filament_drying_active:
                         self.remaining_seconds = 0
                         self.drying_remaining_min = 0
-            if "filament_drying_mode" in data:
-                try:
-                    self.work_mode = 3
-                except Exception:
-                    pass
+            # filament_drying_mode is the drying *preset* name and is present in
+            # every stock-MQTT state payload, so it must NOT by itself imply the
+            # device is in drying mode — only treat it as mode 3 when drying is
+            # actually running (drying_running/isrunning, parsed just above).
+            if "filament_drying_mode" in data and self.filament_drying_active:
+                self.work_mode = 3
             if "filament_button" in data:
                 try:
                     self.filament_button = int(data.get("filament_button"))
@@ -1190,7 +1217,30 @@ class PandaBreath:
                     heater_target)
             else:
                 self.set_device_target(heater_target)
-        
+
+        # Safety reconciliation: the device may only heat while Klipper is
+        # commanding it. If it reports ON while Klipper is not commanding heat —
+        # e.g. it auto-resumed from NVS after a power cycle, was enabled from
+        # Home Assistant / the device button, or missed a prior off command —
+        # force it off so it can never run away unsupervised.
+        #
+        # The exemption is keyed off *Klipper's* intent (_native_mode_commanded),
+        # never the device-reported work_mode: a device put into auto/drying
+        # externally reports mode 1/3 but was not commanded by Klipper, so it
+        # must still be forced off. This also runs during shutdown (we keep
+        # re-asserting OFF) — the poll timer stays live through a Klipper
+        # shutdown.
+        if heater_target is not None:
+            klipper_wants_off = float(heater_target) <= 0.
+        else:
+            klipper_wants_off = self.target <= 0.
+        if (self.work_on and klipper_wants_off
+                and not self._native_mode_commanded):
+            logger.warning(
+                "panda_breath: device reports ON while Klipper is not commanding "
+                "heat — forcing off (uncommanded heating)")
+            self._force_device_off("uncommanded device-on")
+
         return eventtime + REACTOR_POLL
 
     def _lookup_heater_target(self):
