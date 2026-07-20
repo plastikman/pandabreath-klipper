@@ -1,11 +1,12 @@
 # panda_breath.py — Klipper extras module for BIQU Panda Breath
 #
 # Exposes the Panda Breath as a standard Klipper heater (heater_generic interface).
-# Supports two firmware targets via a transport abstraction:
+# Supports three firmware targets via a transport abstraction:
 #
-#   firmware: stock   — OEM WebSocket JSON protocol (ws://<host>/ws)
-#                       Recommended firmware: v1.0.3+; v1.0.4 aliases supported
-#   firmware: esphome — ESPHome MQTT protocol (MQTT 3.1.1 over TCP)
+#   firmware: stock      — OEM WebSocket JSON protocol (ws://<host>/ws)
+#                          Recommended firmware: v1.0.3+; v1.0.4 aliases supported
+#   firmware: stock-mqtt — OEM v1.0.4+ native Home Assistant MQTT (over a broker)
+#   firmware: esphome    — ESPHome MQTT protocol (MQTT 3.1.1 over TCP)
 #
 # No external Python dependencies — stdlib only (socket, struct, hashlib, base64,
 # os, json, threading, collections, time, logging).  The module is a single-file
@@ -29,6 +30,16 @@
 #   check_gain_time: 120
 #   hysteresis: 5
 #   heating_gain: 1
+#
+# printer.cfg — stock firmware v1.0.4+ via native Home Assistant MQTT:
+#   [panda_breath]
+#   firmware: stock-mqtt
+#   mqtt_broker: 127.0.0.1
+#   mqtt_port: 1883
+#   mqtt_device_id: ACEBE68FE51C   # optional; auto-discovered from the state topic
+#   mqtt_username: panda           # optional; only if the broker requires auth
+#   mqtt_password: <secret>        # optional
+#   mqtt_topic_prefix: panda_breath # optional; match the device's on-set prefix
 #
 # printer.cfg — ESPHome firmware:
 #   [panda_breath]
@@ -76,6 +87,68 @@ def _parse_bool(value):
     return None
 
 
+def _normalize_state(fields):
+    """Map a raw device state dict to the normalised keys the poller consumes.
+
+    Shared by every transport so field handling lives in one place: the
+    WebSocket transport passes the ``settings`` object, and the stock-MQTT
+    transport passes its (flat) state payload. The two use closely related
+    field names, so most keys pass straight through and the rest are aliased.
+    """
+    if not isinstance(fields, dict):
+        return {}
+    state = {}
+    # Temperature: prefer the ADC-calibrated reading, fall back to v1.0.4 and
+    # raw aliases.
+    for temp_key in ("cal_warehouse_temp", "chamber_temp", "warehouse_temper"):
+        if temp_key not in fields:
+            continue
+        try:
+            state["temperature"] = float(fields.get(temp_key))
+            break
+        except (TypeError, ValueError):
+            continue
+    for key in ("work_mode", "set_temp", "remaining_seconds", "isrunning",
+                "filament_drying_mode", "target_temp", "heater_temp",
+                "filament_button"):
+        if key in fields:
+            state[key] = fields.get(key)
+    # Stock-MQTT reports the mode as a string ("power on"/"auto mode"/
+    # "filament drying") instead of the numeric work_mode the WS path uses.
+    if "work_mode" not in fields and "mode" in fields:
+        wm = {"power on": 2, "auto mode": 1, "filament drying": 3}.get(
+            str(fields.get("mode")).strip().lower())
+        if wm is not None:
+            state["work_mode"] = wm
+    if "temp" in fields:
+        state["auto_target"] = fields.get("temp")
+    if "filtertemp" in fields:
+        state["auto_filtertemp"] = fields.get("filtertemp")
+    elif "filter_temp" in fields:
+        state["auto_filtertemp"] = fields.get("filter_temp")
+    if "hotbedtemp" in fields:
+        state["auto_hotbedtemp"] = fields.get("hotbedtemp")
+    if "filament_temp" in fields:
+        state["filament_temp"] = fields.get("filament_temp")
+    elif "custom_temp" in fields:
+        state["filament_temp"] = fields.get("custom_temp")
+    if "filament_timer" in fields:
+        state["filament_timer"] = fields.get("filament_timer")
+    elif "custom_timer" in fields:
+        state["filament_timer"] = fields.get("custom_timer")
+    if "drying_remaining_min" in fields:
+        state["drying_remaining_min"] = fields.get("drying_remaining_min")
+    if "drying_running" in fields:
+        parsed = _parse_bool(fields.get("drying_running"))
+        if parsed is not None:
+            state["drying_running"] = parsed
+    if "work_on" in fields:
+        parsed = _parse_bool(fields.get("work_on"))
+        if parsed is not None:
+            state["work_on"] = parsed
+    return state
+
+
 # ─── WebSocket transport (stock OEM firmware) ─────────────────────────────────
 
 class _WebSocketTransport:
@@ -103,6 +176,9 @@ class _WebSocketTransport:
         self._last_target = 0.
         self._last_auto = None
         self._last_drying = None
+        # Serialize socket writes across the reactor thread (set_target /
+        # _send_settings) and the _run thread (pong / reconnect re-apply).
+        self._io_lock = threading.Lock()
 
     def start(self):
         self._running = True
@@ -235,7 +311,8 @@ class _WebSocketTransport:
         else:
             header = struct.pack("!BBQ", 0x81, 0xFF, length)
         try:
-            sock.sendall(header + mask + masked)
+            with self._io_lock:
+                sock.sendall(header + mask + masked)
         except Exception as exc:
             logger.warning("panda_breath: WS send error: %s", exc)
 
@@ -318,7 +395,8 @@ class _WebSocketTransport:
                         break
                     elif opcode == 0x9:  # ping → pong
                         pong = struct.pack("!BB", 0x8A, len(payload)) + payload
-                        sock.sendall(pong)
+                        with self._io_lock:
+                            sock.sendall(pong)
                     elif opcode in (0x1, 0x2):  # text or binary
                         self._dispatch(payload)
             except Exception as exc:
@@ -347,48 +425,7 @@ class _WebSocketTransport:
         settings = msg.get("settings")
         if not isinstance(settings, dict):
             return
-        state = {}
-        # Prefer the ADC-calibrated reading; fall back to v1.0.4 and raw aliases.
-        for temp_key in ("cal_warehouse_temp", "chamber_temp",
-                         "warehouse_temper"):
-            if temp_key not in settings:
-                continue
-            try:
-                state["temperature"] = float(settings.get(temp_key))
-                break
-            except (TypeError, ValueError):
-                continue
-        for key in ("work_mode", "set_temp", "remaining_seconds", "isrunning",
-                    "filament_drying_mode", "target_temp", "heater_temp",
-                    "filament_button"):
-            if key in settings:
-                state[key] = settings.get(key)
-        if "temp" in settings:
-            state["auto_target"] = settings.get("temp")
-        if "filtertemp" in settings:
-            state["auto_filtertemp"] = settings.get("filtertemp")
-        elif "filter_temp" in settings:
-            state["auto_filtertemp"] = settings.get("filter_temp")
-        if "hotbedtemp" in settings:
-            state["auto_hotbedtemp"] = settings.get("hotbedtemp")
-        if "filament_temp" in settings:
-            state["filament_temp"] = settings.get("filament_temp")
-        elif "custom_temp" in settings:
-            state["filament_temp"] = settings.get("custom_temp")
-        if "filament_timer" in settings:
-            state["filament_timer"] = settings.get("filament_timer")
-        elif "custom_timer" in settings:
-            state["filament_timer"] = settings.get("custom_timer")
-        if "drying_remaining_min" in settings:
-            state["drying_remaining_min"] = settings.get("drying_remaining_min")
-        if "drying_running" in settings:
-            parsed = _parse_bool(settings.get("drying_running"))
-            if parsed is not None:
-                state["drying_running"] = parsed
-        if "work_on" in settings:
-            parsed = _parse_bool(settings.get("work_on"))
-            if parsed is not None:
-                state["work_on"] = parsed
+        state = _normalize_state(settings)
         if state:
             self._on_message(state)
 
@@ -411,16 +448,23 @@ class _MqttTransport:
 
     _PING_INTERVAL = 30.
 
-    def __init__(self, broker, port, topic_prefix, on_message, on_disconnect):
+    def __init__(self, broker, port, topic_prefix, on_message, on_disconnect,
+                 username=None, password=None):
         self._broker = broker
         self._port = port
         self._prefix = topic_prefix
         self._on_message = on_message
         self._on_disconnect = on_disconnect
+        self._username = username
+        self._password = password
         self._sock = None
         self._running = False
         self._thread = None
         self._last_target = 0.
+        # Serialize all socket writes: set_target()/force_off() run on the
+        # reactor thread while _run() (PINGREQ, reconnect re-apply) writes the
+        # same socket — interleaved sendall()s could corrupt a frame (incl. OFF).
+        self._io_lock = threading.Lock()
 
     def start(self):
         self._running = True
@@ -434,7 +478,8 @@ class _MqttTransport:
         if sock is not None:
             try:
                 # Best-effort DISCONNECT
-                sock.sendall(b"\xe0\x00")
+                with self._io_lock:
+                    sock.sendall(b"\xe0\x00")
                 sock.close()
             except Exception:
                 pass
@@ -547,7 +592,8 @@ class _MqttTransport:
             return
         pkt = self._build_publish(topic, message)
         try:
-            sock.sendall(pkt)
+            with self._io_lock:
+                sock.sendall(pkt)
         except Exception as exc:
             logger.warning("panda_breath: MQTT publish error: %s", exc)
 
@@ -560,7 +606,8 @@ class _MqttTransport:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(10.)
                 sock.connect((self._broker, self._port))
-                sock.sendall(self._build_connect())
+                sock.sendall(self._build_connect(
+                    username=self._username, password=self._password))
                 # Expect CONNACK (type 2)
                 ptype, _, body = self._recv_packet(sock)
                 if ptype != 2:
@@ -569,8 +616,8 @@ class _MqttTransport:
                 if len(body) >= 2 and body[1] != 0:
                     raise ConnectionError(
                         "MQTT: CONNACK refused, code=%d" % body[1])
-                # Subscribe to chamber temperature topic
-                temp_topic = "%s/sensor/chamber_temperature/state" % self._prefix
+                # Subscribe to the transport's temperature topic
+                temp_topic = self._subscribe_topic()
                 sock.sendall(self._build_subscribe(temp_topic, packet_id=1))
                 # Expect SUBACK (type 9)
                 ptype, _, _ = self._recv_packet(sock)
@@ -588,7 +635,8 @@ class _MqttTransport:
                     # Send PINGREQ on schedule
                     now = time.monotonic()
                     if now - last_ping >= self._PING_INTERVAL:
-                        sock.sendall(self._build_pingreq())
+                        with self._io_lock:
+                            sock.sendall(self._build_pingreq())
                         last_ping = now
                     try:
                         ptype, pflags, body = self._recv_packet(sock)
@@ -633,11 +681,103 @@ class _MqttTransport:
         if qos > 0:
             offset += 2  # skip packet ID (not used for QoS 0 publishes we send)
         payload = body[offset:].decode("utf-8", errors="replace").strip()
+        self._handle_message(topic, payload)
+
+    # ── overridable hooks (ESPHome defaults; see _StockMqttTransport) ──────────
+
+    def _subscribe_topic(self):
+        """Return the single MQTT topic this transport subscribes to."""
+        return "%s/sensor/chamber_temperature/state" % self._prefix
+
+    def _handle_message(self, topic, payload):
+        """Parse a received PUBLISH payload and forward a temperature update."""
         if topic.endswith("/chamber_temperature/state"):
             try:
                 self._on_message({"temperature": float(payload)})
             except (TypeError, ValueError):
                 pass
+
+
+class _StockMqttTransport(_MqttTransport):
+    """MQTT client for the *stock* Panda Breath firmware v1.0.4+ native HA MQTT.
+
+    Unlike the ESPHome transport, the stock firmware uses a fixed, MAC-based
+    topic scheme with JSON payloads:
+
+      subscribe: panda_breath/<id>/state    (JSON; read ``chamber_temp``)
+      publish:   panda_breath/<id>/command  (JSON; e.g. {"target_temp": 45})
+
+    ``<id>`` is the device MAC (e.g. "ACEBE68FE51C"); if not configured it is
+    auto-discovered from the first state topic received. To hold a
+    Klipper-commanded target the device is put in "power on" mode.
+    """
+
+    def __init__(self, broker, port, device_id, on_message, on_disconnect,
+                 username=None, password=None, topic_prefix="panda_breath"):
+        # The stock scheme uses a fixed prefix/<id>/{state,command} rather than
+        # the ESPHome topic_prefix, so the base prefix is unused; keep our own.
+        super().__init__(broker, port, None, on_message, on_disconnect,
+                         username=username, password=password)
+        self._device_id = device_id or None
+        # The v1.0.4 firmware's MQTT prefix is configurable on-device
+        # (NVS ha_mqtt_info); default "panda_breath".
+        self._prefix = (topic_prefix or "panda_breath").strip("/")
+
+    def _subscribe_topic(self):
+        # Wildcard until the id is known, so it can be auto-discovered.
+        return "%s/%s/state" % (self._prefix, self._device_id or "+")
+
+    def _command_topic(self):
+        return "%s/%s/command" % (self._prefix, self._device_id)
+
+    def _off_payload(self):
+        # Mirror the WebSocket off sequence: clear the target and any drying
+        # state so a later button/HA re-enable can't resume a stale target.
+        return json.dumps(
+            {"work_on": "OFF", "target_temp": 0, "drying_running": "OFF"})
+
+    def _handle_message(self, topic, payload):
+        parts = topic.split("/")
+        if not (len(parts) >= 3 and parts[0] == self._prefix
+                and parts[-1] == "state"):
+            return
+        device = parts[1]
+        if self._device_id is None:
+            self._device_id = device
+            logger.info("panda_breath: discovered device id %s", self._device_id)
+            # Now addressable — re-assert the desired state *including* OFF
+            # (target 0), so a pending off is never dropped on discovery.
+            self.set_target(self._last_target)
+        elif device != self._device_id:
+            # Another Panda sharing this broker/prefix — ignore its state so it
+            # can't drive our heating/reconciliation decisions.
+            return
+        try:
+            state = json.loads(payload)
+        except (ValueError, TypeError):
+            return
+        normalized = _normalize_state(state)
+        if normalized:
+            try:
+                self._on_message(normalized)
+            except Exception:
+                pass
+
+    def set_target(self, degrees):
+        self._last_target = degrees
+        if self._device_id is None:
+            return  # not addressable yet; re-applied on discovery
+        if degrees > 0:
+            target = max(0, min(60, int(round(degrees))))
+            self._publish(self._command_topic(), json.dumps(
+                {"work_on": "ON", "mode": "power on", "target_temp": target}))
+        else:
+            self._publish(self._command_topic(), self._off_payload())
+
+    def force_off(self):
+        self._last_target = 0.
+        if self._device_id is not None:
+            self._publish(self._command_topic(), self._off_payload())
 
 
 # ─── Klipper heater class ──────────────────────────────────────────────────────
@@ -656,7 +796,12 @@ class PandaBreath:
 
         # Config
         firmware = config.get("firmware", "stock")
-        self.host = config.get("host")
+        # host/port apply only to the WebSocket ('stock') transport; the MQTT
+        # transports use mqtt_broker instead, so host is optional there.
+        if firmware == "stock":
+            self.host = config.get("host")
+        else:
+            self.host = config.get("host", None)
         self.port = config.getint("port", 80)
 
         # state — modified by reactor poll
@@ -680,6 +825,11 @@ class PandaBreath:
         self.filament_drying_active = False
         self._in_shutdown = False
         self._external_off_lockout = False
+        # True only while Klipper itself has commanded a native mode (auto or
+        # drying). The reconciliation uses this — never the device-*reported*
+        # mode — so a device put into auto/drying externally (HA / button / NVS
+        # resume) is still forced off.
+        self._native_mode_commanded = False
         self._last_temp_time = 0.
         self._sensor = None
         self._virtual_pin = None
@@ -697,8 +847,21 @@ class PandaBreath:
             broker = config.get("mqtt_broker")
             mqtt_port = config.getint("mqtt_port", 1883)
             prefix = config.get("mqtt_topic_prefix", "panda-breath")
+            user = config.get("mqtt_username", None)
+            pw = config.get("mqtt_password", None)
             self._transport = _MqttTransport(
-                broker, mqtt_port, prefix, self._enqueue, self._on_disconnect)
+                broker, mqtt_port, prefix, self._enqueue, self._on_disconnect,
+                username=user, password=pw)
+        elif firmware == "stock-mqtt":
+            broker = config.get("mqtt_broker")
+            mqtt_port = config.getint("mqtt_port", 1883)
+            device_id = config.get("mqtt_device_id", None)
+            user = config.get("mqtt_username", None)
+            pw = config.get("mqtt_password", None)
+            prefix = config.get("mqtt_topic_prefix", "panda_breath")
+            self._transport = _StockMqttTransport(
+                broker, mqtt_port, device_id, self._enqueue, self._on_disconnect,
+                username=user, password=pw, topic_prefix=prefix)
         else:
             raise config.error("panda_breath: unknown firmware '%s'" % firmware)
 
@@ -721,10 +884,15 @@ class PandaBreath:
         self._poll_timer = self.reactor.register_timer(
             self._reactor_poll, self.reactor.NEVER)
 
+        # Only register the native-mode commands the active transport can
+        # actually service — the stock-MQTT transport has no auto/drying
+        # support, so registering them there would just error at call time.
         gcode = self.printer.lookup_object('gcode')
-        gcode.register_command('PANDA_BREATH_AUTO', self._cmd_panda_breath_auto)
-        gcode.register_command('PANDA_BREATH_DRY_START', self._cmd_panda_breath_dry_start)
-        gcode.register_command('PANDA_BREATH_DRY_STOP', self._cmd_panda_breath_dry_stop)
+        if callable(getattr(self._transport, "set_auto_mode", None)):
+            gcode.register_command('PANDA_BREATH_AUTO', self._cmd_panda_breath_auto)
+        if callable(getattr(self._transport, "start_drying", None)):
+            gcode.register_command('PANDA_BREATH_DRY_START', self._cmd_panda_breath_dry_start)
+            gcode.register_command('PANDA_BREATH_DRY_STOP', self._cmd_panda_breath_dry_stop)
 
     def _create_sensor(self, config):
         self._sensor = PandaBreathSensor(config, self)
@@ -768,6 +936,7 @@ class PandaBreath:
         self.remaining_seconds = 0
         self.drying_remaining_min = 0
         self._external_off_lockout = True
+        self._native_mode_commanded = False
         try:
             self._transport.force_off()
             return
@@ -832,6 +1001,7 @@ class PandaBreath:
         self._external_off_lockout = False
         self._clear_heater_target_state()
         self.auto_enabled = bool(enabled)
+        self._native_mode_commanded = bool(enabled)
         self.auto_target = int(target)
         self.auto_filtertemp = int(filtertemp)
         self.auto_hotbedtemp = int(hotbedtemp)
@@ -861,6 +1031,7 @@ class PandaBreath:
             raise gcmd.error(
                 "Panda Breath drying mode is only available with stock firmware transport")
         self._external_off_lockout = False
+        self._native_mode_commanded = True
         self._clear_heater_target_state()
         self.auto_enabled = False
         self.target = 0.
@@ -993,11 +1164,12 @@ class PandaBreath:
                     if not self.filament_drying_active:
                         self.remaining_seconds = 0
                         self.drying_remaining_min = 0
-            if "filament_drying_mode" in data:
-                try:
-                    self.work_mode = 3
-                except Exception:
-                    pass
+            # filament_drying_mode is the drying *preset* name and is present in
+            # every stock-MQTT state payload, so it must NOT by itself imply the
+            # device is in drying mode — only treat it as mode 3 when drying is
+            # actually running (drying_running/isrunning, parsed just above).
+            if "filament_drying_mode" in data and self.filament_drying_active:
+                self.work_mode = 3
             if "filament_button" in data:
                 try:
                     self.filament_button = int(data.get("filament_button"))
@@ -1045,7 +1217,30 @@ class PandaBreath:
                     heater_target)
             else:
                 self.set_device_target(heater_target)
-        
+
+        # Safety reconciliation: the device may only heat while Klipper is
+        # commanding it. If it reports ON while Klipper is not commanding heat —
+        # e.g. it auto-resumed from NVS after a power cycle, was enabled from
+        # Home Assistant / the device button, or missed a prior off command —
+        # force it off so it can never run away unsupervised.
+        #
+        # The exemption is keyed off *Klipper's* intent (_native_mode_commanded),
+        # never the device-reported work_mode: a device put into auto/drying
+        # externally reports mode 1/3 but was not commanded by Klipper, so it
+        # must still be forced off. This also runs during shutdown (we keep
+        # re-asserting OFF) — the poll timer stays live through a Klipper
+        # shutdown.
+        if heater_target is not None:
+            klipper_wants_off = float(heater_target) <= 0.
+        else:
+            klipper_wants_off = self.target <= 0.
+        if (self.work_on and klipper_wants_off
+                and not self._native_mode_commanded):
+            logger.warning(
+                "panda_breath: device reports ON while Klipper is not commanding "
+                "heat — forcing off (uncommanded heating)")
+            self._force_device_off("uncommanded device-on")
+
         return eventtime + REACTOR_POLL
 
     def _lookup_heater_target(self):
