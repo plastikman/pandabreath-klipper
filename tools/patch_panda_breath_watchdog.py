@@ -36,19 +36,31 @@ SAFETY TRADE-OFF (removed feature)
     thermistor-fault shutdown path, and the hardware ~105 C cutoff all remain,
     and this watchdog is a broader, always-relevant safety in its place.
 
-VERSION SUPPORT / SAFETY GATE
+VERSION SUPPORT / SAFETY GATE (fail-closed)
     Unlike the same-length string swaps in patch_panda_breath_70c.py, this patch
     injects code that references absolute per-build addresses (the connection
-    globals, esp_timer, the enable byte). Those differ between firmware builds,
-    so a wrong address would brick the device. This tool therefore locates the
-    sites by code signature and then verifies an exact build fingerprint; if the
-    image is not the validated build it REFUSES rather than risk a bad patch.
+    globals, esp_timer, the enable byte). A wrong address would brick the device,
+    so the gate is fail-closed and independently auditable:
 
-    Validated on: BIQU Panda Breath ESP32-C3 app image, project "panda_breath",
-    ESP-IDF v5.1.4, app compile time "May 28 2026 17:47:48" (ships as v1.0.4).
+      1. PRIMARY: a SHA-256 allowlist of the *parsed* app image (see
+         ACCEPTED_FINGERPRINTS). The hash decides accept/reject. It is taken over
+         the parsed image (entry + segments), not the raw dump, so trailing 0xff
+         partition padding or the appended integrity hash can't change it.
+      2. SECONDARY: the sites are located by code signature and the original
+         bytes are verified before patching. An image is NEVER accepted merely
+         because the instruction patterns happen to occur — the hash must match.
+
+    On rejection the tool prints the detected fingerprint, writes NO output, and
+    explains that the build must be manually analysed first.
+
+    Accepted builds (published fingerprints; publishing hashes does not
+    distribute proprietary firmware):
+      e178ad73…49affbd  Panda Breath v1.0.4 (ESP-IDF 5.1.4), untouched
+      cf7a56dd…d968e94  Panda Breath v1.0.4, 70 C-patched
+    Validated on hardware: BIQU Panda Breath ESP32-C3, app compile "May 28 2026".
     Works on the stock image or one already 70 C-patched (different regions).
-    To support another build, re-derive the fingerprint addresses below (the RE
-    method is in the notes at the end) and validate on hardware before trusting.
+    To add a build: re-derive the addresses/signatures (notes at end), validate
+    on hardware, and add its fingerprint to ACCEPTED_FINGERPRINTS.
 
 USAGE
     python3 patch_panda_breath_watchdog.py <stock_or_70c.bin> <patched.bin>
@@ -60,9 +72,45 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 
 from esptool.bin_image import LoadFirmwareImage
+
+# ── PRIMARY GATE: fail-closed SHA-256 allowlist of accepted app images ────────
+# The fingerprint is taken over the *parsed* ESP application image (entry point +
+# each loadable segment's load address, length, and data) — NOT the raw
+# app-partition dump — so variable trailing 0xff padding, or the image's own
+# appended integrity hash, cannot change it. Publishing these hashes does not
+# distribute the proprietary firmware.
+#
+# The hash decides accept/reject. The code signatures further below are only a
+# second validation layer; an image is NEVER accepted merely because the
+# expected instruction patterns happen to occur.
+#
+# To support a new build: obtain its OEM image, re-derive the addresses and
+# signatures (see the notes at the end of this file), validate on hardware, then
+# add its fingerprint here with a description.
+FP_DOMAIN = b"panda-breath-appimg-v1"
+ACCEPTED_FINGERPRINTS = {
+    "e178ad733456117d6471947d4c449e8f0b14c94f3e80f3c71be9d4a4a49affbd":
+        "Panda Breath ESP32-C3 app v1.0.4 (ESP-IDF 5.1.4, compile May 28 2026), untouched",
+    "cf7a56dd6bd5aa86eff66bbf45613dee2c2e317df4c88826183ed68ead968e94":
+        "Panda Breath ESP32-C3 app v1.0.4, 70C-patched (patch_panda_breath_70c.py)",
+}
+
+
+def image_fingerprint(img) -> str:
+    """Canonical SHA-256 of the parsed app image (dump-padding independent)."""
+    h = hashlib.sha256()
+    h.update(FP_DOMAIN)
+    h.update(int(img.entrypoint).to_bytes(4, "little"))
+    for seg in sorted(img.segments, key=lambda s: s.addr):
+        h.update(int(seg.addr).to_bytes(4, "little"))
+        h.update(len(bytes(seg.data)).to_bytes(4, "little"))
+        h.update(bytes(seg.data))
+    return h.hexdigest()
+
 
 # ── Validated build fingerprint (all addresses are true runtime vaddrs) ───────
 IROM_LOAD = 0x42000020            # IROM segment load address
@@ -139,6 +187,24 @@ def apply_patch(src: Path, dst: Path) -> None:
         seg.data = bytearray(seg.data)
         if not hasattr(seg, "name"):
             seg.name = ""  # save() reads it unconditionally; only set for ELF loads
+
+    # ── PRIMARY GATE (fail-closed): the parsed-image fingerprint must be on the
+    #    allowlist. This decides accept/reject; signatures below are secondary.
+    fp = image_fingerprint(img)
+    if fp not in ACCEPTED_FINGERPRINTS:
+        accepted = "".join(
+            f"    {h}  {desc}\n" for h, desc in ACCEPTED_FINGERPRINTS.items())
+        raise SystemExit(
+            "REFUSE: image fingerprint is not on the accepted allowlist. This tool\n"
+            "applies an absolute-address code patch and will not touch an\n"
+            "unrecognized build (fail-closed). No output written.\n\n"
+            f"  detected fingerprint (parsed app image):\n    {fp}\n\n"
+            f"  accepted builds:\n{accepted}\n"
+            "  This build must be manually analysed and its addresses/signatures\n"
+            "  re-derived (see the reverse-engineering notes at the end of this\n"
+            "  file) and hardware-validated before it can be added to the allowlist."
+        )
+    print(f"fingerprint OK: {fp}\n  = {ACCEPTED_FINGERPRINTS[fp]}")
 
     irom = next((s for s in img.segments if s.addr == IROM_LOAD), None)
     if irom is None:
@@ -278,3 +344,16 @@ if __name__ == "__main__":
 # WebSocket settings serializer and written by the esp-mqtt event handlers; the
 # retired timer is the function containing the 0xea5f (59999 ms) threshold). The
 # trampoline's absolute immediates must be re-encoded for the new addresses.
+#
+# Checklist to add a new accepted build:
+#   1. Re-derive, for that build: HOST_VADDR, REDIRECT_VADDR, NOP_VADDR,
+#      GETTER_VADDR, the ORIG_* bytes, the HOST_SIG/GETTER_SIG/ANCHOR_EA5F
+#      signatures, and the five fingerprint addresses above.
+#   2. Re-assemble the trampoline for that build's addresses (see source above);
+#      update TRAMPOLINE (and the site vaddrs / signatures) — these are currently
+#      single-build constants, so a second build needs them keyed per fingerprint.
+#   3. Compute the image fingerprint:
+#        python3 -c "import patch_panda_breath_watchdog as p, esptool.bin_image as b; \
+#                    print(p.image_fingerprint(b.LoadFirmwareImage('esp32c3','app.bin')))"
+#      and add it to ACCEPTED_FINGERPRINTS with a description.
+#   4. Validate on hardware before trusting.
