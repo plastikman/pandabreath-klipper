@@ -36,7 +36,10 @@
 #   firmware: stock-mqtt
 #   mqtt_broker: 127.0.0.1
 #   mqtt_port: 1883
-#   mqtt_device_id: ACEBE68FE51C   # optional; auto-discovered from the state topic
+#   mqtt_device_id: ACEBE68FE51C   # auto-discovered from the state topic if
+#                                  # unset, but recommended: it is required to
+#                                  # arm the MQTT Last-Will (heater OFF if Klippy
+#                                  # crashes/hangs while the broker stays up)
 #   mqtt_username: panda           # optional; only if the broker requires auth
 #   mqtt_password: <secret>        # optional
 #   mqtt_topic_prefix: panda_breath # optional; match the device's on-set prefix
@@ -67,6 +70,11 @@ RECONNECT_DELAY = 5.
 REACTOR_POLL = 1.
 # Log a warning if no temperature update received within this window (seconds)
 TEMP_STALE_WARN = 60.
+# If the Klipper reactor stops petting the MQTT link for this long, treat the
+# host as dead/hung and drop the socket ungracefully so the broker delivers the
+# Last-Will OFF (covers a Klippy crash or reactor hang while the broker and the
+# Panda's broker link stay up — the case the device-side watchdog can't see).
+MQTT_WILL_HEARTBEAT_STALE = 30.
 
 
 def _parse_bool(value):
@@ -194,6 +202,9 @@ class _WebSocketTransport:
                 sock.close()
             except Exception:
                 pass
+
+    def heartbeat(self):
+        """No-op: the WebSocket transport has no MQTT Last Will to gate."""
 
     def set_target(self, degrees):
         self._last_target = degrees
@@ -465,6 +476,20 @@ class _MqttTransport:
         # reactor thread while _run() (PINGREQ, reconnect re-apply) writes the
         # same socket — interleaved sendall()s could corrupt a frame (incl. OFF).
         self._io_lock = threading.Lock()
+        # MQTT Last Will — armed by subclasses that know their command topic at
+        # CONNECT time. The broker delivers it if this client drops WITHOUT a
+        # clean DISCONNECT (a Klippy crash, or a reactor hang detected via the
+        # heartbeat below). None = no Will.
+        self._will_topic = None
+        self._will_payload = None
+        # Proof-of-life stamp; the Klipper reactor calls heartbeat() each poll.
+        self._last_heartbeat = time.monotonic()
+
+    def heartbeat(self):
+        """Called from the Klipper reactor as proof-of-life. If it stops (Klippy
+        crash/hang), _run() drops the link ungracefully so the broker fires the
+        Will. A no-op for transports that don't use a Will."""
+        self._last_heartbeat = time.monotonic()
 
     def start(self):
         self._running = True
@@ -522,8 +547,11 @@ class _MqttTransport:
         return struct.pack("!H", len(encoded)) + encoded
 
     def _build_connect(self, client_id="panda_breath_klipper",
-                       keepalive=60, username=None, password=None):
+                       keepalive=60, username=None, password=None,
+                       will_topic=None, will_payload=None):
         flags = 0x02  # clean session
+        if will_topic is not None:
+            flags |= 0x04  # Will Flag (Will QoS 0, Will Retain 0)
         if username:
             flags |= 0x80
         if password:
@@ -533,6 +561,13 @@ class _MqttTransport:
               + bytes([flags])
               + struct.pack("!H", keepalive))
         payload = self._mqtt_str(client_id)
+        if will_topic is not None:
+            # MQTT 3.1.1: Will Topic + Will Message follow the client id (before
+            # username/password). Topic is a UTF-8 string; message is a
+            # length-prefixed binary field.
+            wmsg = will_payload.encode("utf-8")
+            payload += self._mqtt_str(will_topic)
+            payload += struct.pack("!H", len(wmsg)) + wmsg
         if username:
             payload += self._mqtt_str(username)
         if password:
@@ -607,7 +642,8 @@ class _MqttTransport:
                 sock.settimeout(10.)
                 sock.connect((self._broker, self._port))
                 sock.sendall(self._build_connect(
-                    username=self._username, password=self._password))
+                    username=self._username, password=self._password,
+                    will_topic=self._will_topic, will_payload=self._will_payload))
                 # Expect CONNACK (type 2)
                 ptype, _, body = self._recv_packet(sock)
                 if ptype != 2:
@@ -628,12 +664,30 @@ class _MqttTransport:
                 self._sock = sock
                 logger.info("panda_breath: MQTT connected to %s:%s",
                             self._broker, self._port)
-                # Resend desired state after reconnect
-                self.set_target(self._last_target)
+                # Resend desired state after reconnect — but if the reactor is
+                # already stale (host hung), don't re-assert heat; just let the
+                # Will fire below.
+                if (not self._will_topic
+                        or time.monotonic() - self._last_heartbeat
+                        <= MQTT_WILL_HEARTBEAT_STALE):
+                    self.set_target(self._last_target)
                 last_ping = time.monotonic()
                 while self._running:
-                    # Send PINGREQ on schedule
                     now = time.monotonic()
+                    # Klippy crash/hang guard: on a hang the I/O thread keeps
+                    # PINGREQ alive, so the broker never times us out — we must
+                    # drop the link OURSELVES, ungracefully (no DISCONNECT), so
+                    # the broker delivers the Will (OFF). The finally: below
+                    # closes the socket without sending a DISCONNECT.
+                    if (self._will_topic
+                            and now - self._last_heartbeat
+                            > MQTT_WILL_HEARTBEAT_STALE):
+                        logger.warning(
+                            "panda_breath: reactor heartbeat stale %.0fs — "
+                            "dropping MQTT link so the broker delivers the OFF "
+                            "Will", now - self._last_heartbeat)
+                        break
+                    # Send PINGREQ on schedule
                     if now - last_ping >= self._PING_INTERVAL:
                         with self._io_lock:
                             sock.sendall(self._build_pingreq())
@@ -722,6 +776,22 @@ class _StockMqttTransport(_MqttTransport):
         # The v1.0.4 firmware's MQTT prefix is configurable on-device
         # (NVS ha_mqtt_info); default "panda_breath".
         self._prefix = (topic_prefix or "panda_breath").strip("/")
+        # Arm an MQTT Last Will = OFF on the command topic. The broker delivers
+        # it if this client drops without a clean DISCONNECT (a Klippy crash, or
+        # a reactor hang caught by the heartbeat in the base transport). This
+        # covers the one case the device-side firmware watchdog can't: the broker
+        # and the Panda's broker link stay up, but the Klipper host is dead.
+        # The command topic must be known at CONNECT time, so an explicit
+        # mqtt_device_id is required to arm the Will.
+        if self._device_id is not None:
+            self._will_topic = self._command_topic()
+            self._will_payload = self._off_payload()
+        else:
+            logger.warning(
+                "panda_breath: no mqtt_device_id configured — MQTT Last-Will "
+                "safety (heater OFF on a Klippy crash/hang) is DISABLED. The "
+                "device-side firmware watchdog still covers broker/network loss. "
+                "Set mqtt_device_id to enable the Will.")
 
     def _subscribe_topic(self):
         # Wildcard until the id is known, so it can be auto-discovered.
@@ -1072,6 +1142,10 @@ class PandaBreath:
         self.is_connected = False
 
     def _reactor_poll(self, eventtime):
+        # Proof-of-life for the MQTT Last-Will heartbeat: this reactor timer
+        # fires on schedule while Klippy is healthy; if it stops (crash/hang)
+        # the MQTT thread drops the link so the broker delivers the OFF Will.
+        self._transport.heartbeat()
         while self._state_queue:
             data = self._state_queue.popleft()
             self.is_connected = True
