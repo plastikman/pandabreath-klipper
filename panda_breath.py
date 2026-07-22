@@ -462,6 +462,12 @@ class _MqttTransport:
     # heartbeat-stale check (and PING scheduling) run ~1 Hz regardless of when
     # packets arrive — a long blocking recv would delay the stale-link Will.
     _POLL_INTERVAL = 1.
+    # Per-read socket timeout once connected. select() only guarantees SOME bytes
+    # are ready, not a whole MQTT packet, so a packet that starts but stalls
+    # mid-frame must not block the loop (and the heartbeat check) for a full
+    # keepalive. If a complete packet doesn't arrive within this window the frame
+    # is lost, so we reconnect (fail-off) rather than misparse leftover bytes.
+    _RECV_TIMEOUT = 3.
 
     def __init__(self, broker, port, topic_prefix, on_message, on_disconnect,
                  username=None, password=None):
@@ -669,7 +675,7 @@ class _MqttTransport:
                 if ptype != 9:
                     raise ConnectionError(
                         "MQTT: expected SUBACK (9), got %d" % ptype)
-                sock.settimeout(self._PING_INTERVAL + 5.)
+                sock.settimeout(self._RECV_TIMEOUT)
                 self._sock = sock
                 logger.info("panda_breath: MQTT connected to %s:%s",
                             self._broker, self._port)
@@ -715,7 +721,13 @@ class _MqttTransport:
                     try:
                         ptype, pflags, body = self._recv_packet(sock)
                     except socket.timeout:
-                        continue
+                        # select() said data was ready but a full packet didn't
+                        # arrive within _RECV_TIMEOUT: a partial frame stalled, so
+                        # framing is now ambiguous. Reconnect (fail-off) rather
+                        # than continue and misparse the leftover bytes.
+                        logger.warning("panda_breath: MQTT read timed out "
+                                       "mid-packet — reconnecting")
+                        break
                     if ptype == 3:   # PUBLISH
                         self._dispatch_publish(pflags, body)
                     elif ptype == 13:  # PINGRESP — nothing to do
@@ -780,9 +792,10 @@ class _StockMqttTransport(_MqttTransport):
       subscribe: panda_breath/<id>/state    (JSON; read ``chamber_temp``)
       publish:   panda_breath/<id>/command  (JSON; e.g. {"target_temp": 45})
 
-    ``<id>`` is the device MAC (e.g. "ACEBE68FE51C"); if not configured it is
-    auto-discovered from the first state topic received. To hold a
-    Klipper-commanded target the device is put in "power on" mode.
+    ``<id>`` is the device MAC (e.g. "ACEBE68FE51C") and is **required**
+    (``mqtt_device_id``), so the command topic — and thus the OFF Last Will — is
+    known at connect time. To hold a Klipper-commanded target the device is put
+    in "power on" mode.
     """
 
     def __init__(self, broker, port, device_id, on_message, on_disconnect,
@@ -800,13 +813,15 @@ class _StockMqttTransport(_MqttTransport):
         # broker can't evict a same-id session and fire a spurious OFF Will) and
         # arm the OFF Will now. The Will covers the one case the device-side
         # firmware watchdog can't: the broker and the Panda's broker link stay
-        # up, but the Klipper host is dead.
-        self._client_id = "panda_breath_klipper_%s" % self._device_id
+        # up, but the Klipper host is dead. Keep the id within MQTT's universally
+        # supported 23-char limit: "pbk_" + a 12-char MAC = 16 chars.
+        self._client_id = "pbk_%s" % self._device_id
         self._will_topic = self._command_topic()
         self._will_payload = self._off_payload()
 
     def _subscribe_topic(self):
-        # Wildcard until the id is known, so it can be auto-discovered.
+        # device_id is required (config-enforced); "+" is only a defensive
+        # fallback and should not normally be reached.
         return "%s/%s/state" % (self._prefix, self._device_id or "+")
 
     def _command_topic(self):
