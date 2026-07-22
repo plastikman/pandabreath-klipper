@@ -36,10 +36,9 @@
 #   firmware: stock-mqtt
 #   mqtt_broker: 127.0.0.1
 #   mqtt_port: 1883
-#   mqtt_device_id: ACEBE68FE51C   # auto-discovered from the state topic if
-#                                  # unset, but recommended: it is required to
-#                                  # arm the MQTT Last-Will (heater OFF if Klippy
-#                                  # crashes/hangs while the broker stays up)
+#   mqtt_device_id: ACEBE68FE51C   # REQUIRED (the device MAC). Needed at connect
+#                                  # time to arm the MQTT Last-Will (heater OFF if
+#                                  # Klippy crashes/hangs while the broker stays up)
 #   mqtt_username: panda           # optional; only if the broker requires auth
 #   mqtt_password: <secret>        # optional
 #   mqtt_topic_prefix: panda_breath # optional; match the device's on-set prefix
@@ -57,6 +56,7 @@ import hashlib
 import json
 import logging
 import os
+import select
 import socket
 import struct
 import threading
@@ -458,6 +458,10 @@ class _MqttTransport:
     """
 
     _PING_INTERVAL = 30.
+    # Readability poll interval for the receive loop. Kept short so the Klippy
+    # heartbeat-stale check (and PING scheduling) run ~1 Hz regardless of when
+    # packets arrive — a long blocking recv would delay the stale-link Will.
+    _POLL_INTERVAL = 1.
 
     def __init__(self, broker, port, topic_prefix, on_message, on_disconnect,
                  username=None, password=None):
@@ -472,6 +476,10 @@ class _MqttTransport:
         self._running = False
         self._thread = None
         self._last_target = 0.
+        # MQTT client id. A shared id lets the broker evict a same-id session
+        # (session takeover), which would fire a spurious OFF Will — subclasses
+        # override this with a per-device unique id.
+        self._client_id = "panda_breath_klipper"
         # Serialize all socket writes: set_target()/force_off() run on the
         # reactor thread while _run() (PINGREQ, reconnect re-apply) writes the
         # same socket — interleaved sendall()s could corrupt a frame (incl. OFF).
@@ -642,6 +650,7 @@ class _MqttTransport:
                 sock.settimeout(10.)
                 sock.connect((self._broker, self._port))
                 sock.sendall(self._build_connect(
+                    client_id=self._client_id,
                     username=self._username, password=self._password,
                     will_topic=self._will_topic, will_payload=self._will_payload))
                 # Expect CONNACK (type 2)
@@ -692,10 +701,20 @@ class _MqttTransport:
                         with self._io_lock:
                             sock.sendall(self._build_pingreq())
                         last_ping = now
+                    # Poll readability with a short interval so the loop keeps
+                    # re-checking the heartbeat/PING above ~1 Hz even when idle
+                    # (so a stale reactor is acted on within ~1s of the threshold
+                    # rather than up to a full keepalive later). Only read once
+                    # data is present, so a packet body is never split by the poll.
+                    try:
+                        ready, _, _ = select.select([sock], [], [], self._POLL_INTERVAL)
+                    except (OSError, ValueError):
+                        break
+                    if not ready:
+                        continue
                     try:
                         ptype, pflags, body = self._recv_packet(sock)
                     except socket.timeout:
-                        # Use timeout to drive ping; not a fatal error
                         continue
                     if ptype == 3:   # PUBLISH
                         self._dispatch_publish(pflags, body)
@@ -776,22 +795,15 @@ class _StockMqttTransport(_MqttTransport):
         # The v1.0.4 firmware's MQTT prefix is configurable on-device
         # (NVS ha_mqtt_info); default "panda_breath".
         self._prefix = (topic_prefix or "panda_breath").strip("/")
-        # Arm an MQTT Last Will = OFF on the command topic. The broker delivers
-        # it if this client drops without a clean DISCONNECT (a Klippy crash, or
-        # a reactor hang caught by the heartbeat in the base transport). This
-        # covers the one case the device-side firmware watchdog can't: the broker
-        # and the Panda's broker link stay up, but the Klipper host is dead.
-        # The command topic must be known at CONNECT time, so an explicit
-        # mqtt_device_id is required to arm the Will.
-        if self._device_id is not None:
-            self._will_topic = self._command_topic()
-            self._will_payload = self._off_payload()
-        else:
-            logger.warning(
-                "panda_breath: no mqtt_device_id configured — MQTT Last-Will "
-                "safety (heater OFF on a Klippy crash/hang) is DISABLED. The "
-                "device-side firmware watchdog still covers broker/network loss. "
-                "Set mqtt_device_id to enable the Will.")
+        # mqtt_device_id is required (enforced at config load), so the command
+        # topic is known at CONNECT time. Use a per-device client id (so the
+        # broker can't evict a same-id session and fire a spurious OFF Will) and
+        # arm the OFF Will now. The Will covers the one case the device-side
+        # firmware watchdog can't: the broker and the Panda's broker link stay
+        # up, but the Klipper host is dead.
+        self._client_id = "panda_breath_klipper_%s" % self._device_id
+        self._will_topic = self._command_topic()
+        self._will_payload = self._off_payload()
 
     def _subscribe_topic(self):
         # Wildcard until the id is known, so it can be auto-discovered.
@@ -925,7 +937,17 @@ class PandaBreath:
         elif firmware == "stock-mqtt":
             broker = config.get("mqtt_broker")
             mqtt_port = config.getint("mqtt_port", 1883)
+            # Required (not auto-discovered): the command topic must be known at
+            # CONNECT time to arm the MQTT Last-Will that forces the heater OFF on
+            # a Klippy crash/hang. Discovering it post-connect would leave that
+            # exact failure uncovered until a reconnect.
             device_id = config.get("mqtt_device_id", None)
+            if not device_id:
+                raise config.error(
+                    "panda_breath: 'mqtt_device_id' is required for firmware "
+                    "'stock-mqtt' (the device MAC, e.g. ACEBE68FE51C) so the MQTT "
+                    "Last-Will safety (heater OFF on a Klippy crash/hang) can be "
+                    "armed at connect time.")
             user = config.get("mqtt_username", None)
             pw = config.get("mqtt_password", None)
             prefix = config.get("mqtt_topic_prefix", "panda_breath")
